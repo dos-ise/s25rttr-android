@@ -21,6 +21,7 @@ android {
     }
     
     compileSdkVersion 36
+    buildToolsVersion "36.0.0"
     defaultConfig {
     	archivesBaseName = "s25rttr"
     	applicationId "org.s25rttr.sdl"
@@ -30,7 +31,7 @@ android {
         versionName "2.0.2"
         externalNativeBuild {
              cmake {
-                 arguments "-DANDROID_APP_PLATFORM=android-28", "-DANDROID_STL=c++_shared"
+                 arguments "-DANDROID_APP_PLATFORM=android-28", "-DANDROID_STL=c++_shared", "-DCMAKE_SHARED_LINKER_FLAGS=-lc++_shared"
                  abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
                  //abiFilters 'x86_64'
              }
@@ -44,10 +45,11 @@ android {
     }
     applicationVariants.all { variant ->
         tasks[("merge${variant.name.capitalize()}Assets")]
-            .dependsOn("externalNativeBuild${variant.name.capitalize()}")
+            .dependsOn("externalNativeBuild${variant.name.capitalize()}", "normalizeAssets")
+        tasks["normalizeAssets"].mustRunAfter("externalNativeBuild${variant.name.capitalize()}")
 
         tasks[("externalNativeBuild${variant.name.capitalize()}")]
-            .dependsOn(["buildDependencies", "genAssetHashes"])
+            .dependsOn(["buildDependencies", "genAssetHashes", "patchS25client"])
     }
     if (!project.hasProperty('EXCLUDE_NATIVE_LIBS')) {
         sourceSets.main {
@@ -178,17 +180,19 @@ tasks.register("buildDependencies") {
 
             exec {
                 commandLine( cmake,
+                    "-G", "Ninja",
                     "-S", depSrc,
                     "-B", buildDir,
                     "-DCMAKE_TOOLCHAIN_FILE=$ndkDir/build/cmake/android.toolchain.cmake",
                     "-DANDROID_ABI=$abi",
                     "-DANDROID_PLATFORM=android-28",
+                    "-DCMAKE_SHARED_LINKER_FLAGS=-lc++_shared",
                     "-DCMAKE_BUILD_TYPE=Release")
             }
 
             exec {
                 workingDir(buildDir)
-                commandLine( cmake, "--build", ".", "--", "-j")
+                commandLine( cmake, "--build", ".", "--", "-j${Runtime.runtime.availableProcessors()}")
             }
         }
     }
@@ -211,6 +215,40 @@ static def WriteAssetHashes(fileList, File hashFile) {
     }
 }
 
+// A Windows checkout with core.autocrlf=true yields CRLF text assets (e.g. sound.scs),
+// which RTTR's line based parsers reject ("No index or value").
+def normalizeAssetLineEndings = { File assetDir ->
+    if(!assetDir.exists())
+        return
+    fileTree(assetDir).matching { include "**/*.scs", "**/*.lua", "**/*.ini", "**/*.txt" }.each { File f ->
+        def text = f.getText("UTF-8")
+        if(text.contains("\r\n"))
+            f.setText(text.replace("\r\n", "\n"), "UTF-8")
+    }
+}
+
+// Applies patches/s25client-android-windows-build.patch to the s25client submodule (no-op if already applied)
+tasks.register("patchS25client") {
+    doLast {
+        def patch = file("$rootDir/patches/s25client-android-windows-build.patch")
+        def repo = file("$rootDir/app/jni/s25client")
+        def run = { List<String> args ->
+            def p = new ProcessBuilder(["git", "-C", repo.absolutePath] + args).redirectErrorStream(true).start()
+            p.inputStream.text
+            p.waitFor()
+        }
+        if(run(["apply", "--reverse", "--check", patch.absolutePath]) == 0)
+            return
+        if(run(["apply", patch.absolutePath]) != 0)
+            throw new GradleException("Failed to apply ${patch.name} to app/jni/s25client")
+    }
+}
+
+tasks.register("normalizeAssets") {
+    def assetDir = file("$rootDir/app/src/main/assets/RTTR")
+    doLast { normalizeAssetLineEndings(assetDir) }
+}
+
 tasks.register("genAssetHashes") {
     def assetDir = "$rootDir/app/src/main/assets/RTTR"
     def hashFile = file("$rootDir/app/src/main/assets/assetHashes")
@@ -218,6 +256,8 @@ tasks.register("genAssetHashes") {
     def files = []
 
     doLast {
+        normalizeAssetLineEndings(file(assetDir))
+
         // Generate hashes for every asset
         fileTree(assetDir).visit { FileVisitDetails details ->
             if(!details.isDirectory())
@@ -265,4 +305,6 @@ dependencies {
     implementation fileTree(include: ['*.jar'], dir: 'libs')
     implementation 'com.android.support.constraint:constraint-layout:2.0.4'
     implementation 'com.android.support:recyclerview-v7:28.0.0'
+    implementation 'com.google.code.gson:gson:2.9.0'
+    implementation 'org.tukaani:xz:1.9'
 }
